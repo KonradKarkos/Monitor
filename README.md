@@ -6,7 +6,7 @@ MonitorTest project is exact copy of Monitor but it uses arguments passed by use
 
 Known issues (21.05.20):
 - ~~If two processes want to enter same object at the same time - they will.~~
-- ~~Can lead to deadlock if one process will receive too many messages at the same time.~~
+- ~~Can lead to deadlock if one process receives too many messages at the same time.~~
 - ~~Enter works as Try_Enter.~~
 - Cout messages can misrepresent actual state of process due to multithreading.
-- If two process will start entering the same object at the same time it will most probably result in deadlock - better to use try_enter.
+- If two processes will start entering the same object at the same time it will most probably result in deadlock - better to use try_enter.
