@@ -1,6 +1,7 @@
 #ifndef MONITOR_H
 #define MONITOR_H
 #include <iostream>
+#include <chrono>
 #include <string>
 #include <map>
 #include <zmq.h>
@@ -30,17 +31,18 @@ private:
 	static std::string ownAddress;
 	static int ownPort;
 	static std::vector<std::string> allProcessesAddresses;
-	std::list<std::string> currentRequestedOrTakenObjects;
+	std::map<std::string, std::string> currentRequestedOrTakenObjects;
 	process_state currentState;
 	std::thread checker;
 	bool infinite;
-	void check_for_more_ports();
+	bool check_for_more_ports();
 	void send_all_message(std::string objectName, std::string msg, int addPulseMode);
 	void add_process_address(std::string address);
 	void add_process(std::string objectName, std::string processAddress, process_state state);
 	void remove_process(std::string objectName, std::string processAddress);
-	bool request_permission_to_enter(std::string objectName);
+	bool request_permission_to_enter(std::string objectName, std::string timestamp);
 	std::vector<std::string> split(const std::string& s);
+	bool file_exists(const std::string& filename);
 public:
 	process_state get_current_process_state();
 	void enter(std::string objectName, bool& lockAcquired);

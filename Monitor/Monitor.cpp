@@ -6,50 +6,91 @@ void* monitor::sckt;
 std::string monitor::ownAddress;
 int monitor::ownPort;
 std::vector<std::string> monitor::allProcessesAddresses;
-void monitor::check_for_more_ports()
+bool monitor::file_exists(const std::string& filename)
 {
-	std::ifstream fports;
-	fports.open("ports.txt");
-	if (fports.is_open())
+	WIN32_FIND_DATAA fd = { 0 };
+	HANDLE hFound = FindFirstFileA(filename.c_str(), &fd);
+	bool retval = hFound != INVALID_HANDLE_VALUE;
+	FindClose(hFound);
+
+	return retval;
+}
+bool monitor::check_for_more_ports()
+{
+	if (file_exists("ports.txt"))
 	{
-		std::string line;
-		int i = 0;
-		bool alreadyThere = false;
-		while (getline(fports, line))
+		std::ifstream fports;
+		fports.open("ports.txt");
+		if (fports.is_open())
 		{
-			if (line == std::to_string(ownPort))
+			std::string line;
+			std::string addr;
+			char* bufMsg = new char[256];
+			std::string msg = "newproc," + ownAddress;
+			int i = 0;
+			bool alreadyThere = false;
+			void* scktM = zmq_socket(context, ZMQ_REQ);
+			while (getline(fports, line))
 			{
-				alreadyThere = true;
+				if (line == std::to_string(ownPort))
+				{
+					alreadyThere = true;
+				}
+				else
+				{
+					addr = "tcp://127.0.0.1:" + line;
+					add_process_address(addr);
+					if (zmq_connect(scktM, addr.c_str()) == 0)
+					{
+						if (zmq_send(scktM, msg.c_str(), strlen(msg.c_str()), 0) > -1)
+							zmq_recv(scktM, bufMsg, 256, 0);
+						zmq_disconnect(scktM, addr.c_str());
+					}
+				}
 			}
-			else
+			fports.close();
+			zmq_close(scktM);
+			if (!alreadyThere)
 			{
-				add_process_address("tcp://127.0.0.1:" + line);
+				std::ofstream ofports;
+				ofports.open("ports.txt", std::ios::app);
+				if (ofports.is_open())
+				{
+					ofports << ownPort << std::endl;
+					ofports.flush();
+					ofports.close();
+					return true;
+				}
+				else
+				{
+					ofports.close();
+					return false;
+				}
 			}
+			return true;
 		}
-		fports.close();
-		if (!alreadyThere)
+		else
 		{
-			std::ofstream ofports;
-			ofports.open("ports.txt", std::ios::app);
-			if (ofports.is_open())
-			{
-				ofports << ownPort << std::endl;
-				ofports.flush();
-			}
-			ofports.close();
+			fports.close();
+			return false;
 		}
 	}
 	else
 	{
-		fports.close();
 		std::ofstream ofports;
 		ofports.open("ports.txt");
 		if (ofports.is_open())
 		{
 			ofports << std::to_string(ownPort) + "\n";
 			ofports.flush();
+			ofports.close();
+			return true;
 		}
-		ofports.close();
+		else
+		{
+			ofports.close();
+			return false;
+		}
 	}
 }
 void monitor::send_all_message(std::string objectName, std::string msg, int addPulseMode)
@@ -91,12 +132,12 @@ void monitor::add_process(std::string objectName, std::string processAddress, pr
 	if (it == waitingThreadsTmp.end())
 	{
 		std::map<std::string, process_state> m;
-		m.insert(std::pair<std::string, process_state>(processAddress, state));
-		waitingThreads.insert(std::pair<std::string, std::map<std::string, process_state>>(objectName, m));
+		m.insert(std::make_pair(processAddress, state));
+		waitingThreads.insert(std::make_pair(objectName, m));
 	}
 	else if (it != waitingThreadsTmp.end() && it->second.find(processAddress) == it->second.end())
 	{
-		waitingThreads.find(objectName)->second.insert(std::pair<std::string, process_state>(processAddress, state));
+		waitingThreads.find(objectName)->second.insert(std::make_pair(processAddress, state));
 	}
 	else if (it != waitingThreadsTmp.end() && it->second.find(processAddress) != it->second.end())
 	{
@@ -114,7 +155,7 @@ void monitor::remove_process(std::string objectName, std::string processAddress)
 	}
 	mtx.unlock();
 }
-bool monitor::request_permission_to_enter(std::string objectName)
+bool monitor::request_permission_to_enter(std::string objectName, std::string timestamp)
 {
 	bool permIssued = true;
 	std::vector<std::string> allProcessesAddressesTMP = allProcessesAddresses;
@@ -125,7 +166,7 @@ bool monitor::request_permission_to_enter(std::string objectName)
 	std::string finalReply;
 	int timeout = 2000;
 	zmq_setsockopt(scktR, ZMQ_RCVTIMEO, &timeout, sizeof(int));
-	std::string toSendMsg = "perment," + ownAddress + "," + objectName;
+	std::string toSendMsg = "perment," + ownAddress + "," + objectName + "," + timestamp;
 	for (int i = 0; i < allProcessesAddressesTMP.size(); i++)
 	{
 		if (zmq_connect(scktR, allProcessesAddressesTMP[i].c_str()) == 0)
@@ -166,7 +207,9 @@ process_state monitor::get_current_process_state()
 void monitor::enter(std::string objectName, bool& lockAcquired)
 {
 	currentState = process_state::REQUESTING;
-	currentRequestedOrTakenObjects.push_back(objectName);
+	std::stringstream timestamp;
+	timestamp << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	currentRequestedOrTakenObjects.insert(std::make_pair(objectName, timestamp.str()));
 	lockAcquired = false;
 	while (!lockAcquired)
 	{
@@ -174,18 +217,18 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 		std::map<std::string, std::map<std::string, process_state>>::iterator it = waitingThreads.find(objectName);
 		if (it == waitingThreads.end())
 		{
-			if (request_permission_to_enter(objectName))
+			if (request_permission_to_enter(objectName, timestamp.str()))
 			{
 				std::map<std::string, process_state> m;
-				m.insert(std::pair<std::string, process_state>(ownAddress, process_state::WORKING));
-				waitingThreads.insert(std::pair<std::string, std::map<std::string, process_state>>(objectName, m));
+				m.insert(std::make_pair(ownAddress, process_state::WORKING));
+				waitingThreads.insert(std::make_pair(objectName, m));
 				lockAcquired = true;
 				send_all_message(objectName, "entered", 0);
 			}
 			else
 			{
 				lockAcquired = false;
-				currentRequestedOrTakenObjects.remove(objectName);
+				currentRequestedOrTakenObjects.erase(objectName);
 			}
 		}
 		else
@@ -197,17 +240,17 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 				{
 					isTaken = true;
 					lockAcquired = false;
-					currentRequestedOrTakenObjects.remove(objectName);
+					currentRequestedOrTakenObjects.erase(objectName);
 					break;
 				}
 			}
 			if (!isTaken)
 			{
-				if (request_permission_to_enter(objectName))
+				if (request_permission_to_enter(objectName, timestamp.str()))
 				{
 					if (it->second.find(ownAddress) == it->second.end())
 					{
-						it->second.insert(std::pair<std::string, process_state>(ownAddress, process_state::WORKING));
+						it->second.insert(std::make_pair(ownAddress, process_state::WORKING));
 					}
 					else
 					{
@@ -219,7 +262,7 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 				else
 				{
 					lockAcquired = false;
-					currentRequestedOrTakenObjects.remove(objectName);
+					currentRequestedOrTakenObjects.erase(objectName);
 				}
 			}
 		}
@@ -231,16 +274,18 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 void monitor::try_enter(std::string objectName, bool& lockAcquired)
 {
 	currentState = process_state::REQUESTING;
-	currentRequestedOrTakenObjects.push_back(objectName);
+	std::stringstream timestamp;
+	timestamp << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	currentRequestedOrTakenObjects.insert(std::make_pair(objectName, timestamp.str()));
 	while (mtx.try_lock() == false) {}
 	std::map<std::string, std::map<std::string, process_state>>::iterator it = waitingThreads.find(objectName);
 	if (it == waitingThreads.end())
 	{
-		if (request_permission_to_enter(objectName))
+		if (request_permission_to_enter(objectName, timestamp.str()))
 		{
 			std::map<std::string, process_state> m;
-			m.insert(std::pair<std::string, process_state>(ownAddress, process_state::WORKING));
-			waitingThreads.insert(std::pair<std::string, std::map<std::string, process_state>>(objectName, m));
+			m.insert(std::make_pair(ownAddress, process_state::WORKING));
+			waitingThreads.insert(std::make_pair(objectName, m));
 			lockAcquired = true;
 			send_all_message(objectName, "entered", 0);
 			currentState = process_state::WORKING;
@@ -248,7 +293,7 @@ void monitor::try_enter(std::string objectName, bool& lockAcquired)
 		else
 		{
 			lockAcquired = false;
-			currentRequestedOrTakenObjects.remove(objectName);
+			currentRequestedOrTakenObjects.erase(objectName);
 		}
 	}
 	else
@@ -260,17 +305,17 @@ void monitor::try_enter(std::string objectName, bool& lockAcquired)
 			{
 				isTaken = true;
 				lockAcquired = false;
-				currentRequestedOrTakenObjects.remove(objectName);
+				currentRequestedOrTakenObjects.erase(objectName);
 				break;
 			}
 		}
 		if (!isTaken)
 		{
-			if (request_permission_to_enter(objectName))
+			if (request_permission_to_enter(objectName, timestamp.str()))
 			{
 				if (it->second.find(ownAddress) == it->second.end())
 				{
-					it->second.insert(std::pair<std::string, process_state>(ownAddress, process_state::WORKING));
+					it->second.insert(std::make_pair(ownAddress, process_state::WORKING));
 				}
 				else
 				{
@@ -283,7 +328,7 @@ void monitor::try_enter(std::string objectName, bool& lockAcquired)
 			else
 			{
 				lockAcquired = false;
-				currentRequestedOrTakenObjects.remove(objectName);
+				currentRequestedOrTakenObjects.erase(objectName);
 			}
 		}
 	}
@@ -314,7 +359,7 @@ void monitor::wait(std::string objectName, int miliseconds, bool& lockAcquired)
 		{
 			if (it->second.find(ownAddress)->second == process_state::WORKING)
 			{
-				currentRequestedOrTakenObjects.remove(objectName);
+				currentRequestedOrTakenObjects.erase(objectName);
 				pulse_all(objectName);
 			}
 			waitingThreads.find(objectName)->second.find(ownAddress)->second = process_state::WAITING;
@@ -322,7 +367,7 @@ void monitor::wait(std::string objectName, int miliseconds, bool& lockAcquired)
 		}
 		else
 		{
-			waitingThreads.find(objectName)->second.insert(std::pair<std::string, process_state>(ownAddress, process_state::WAITING));
+			waitingThreads.find(objectName)->second.insert(std::make_pair(ownAddress, process_state::WAITING));
 			currentState = process_state::WAITING;
 		}
 		send_all_message(objectName, "waiting", 0);
@@ -383,7 +428,7 @@ void monitor::wait(std::string objectName, bool& lockAcquired)
 		{
 			if (it->second.find(ownAddress)->second == process_state::WORKING)
 			{
-				currentRequestedOrTakenObjects.remove(objectName);
+				currentRequestedOrTakenObjects.erase(objectName);
 				pulse_all(objectName);
 			}
 			waitingThreads.find(objectName)->second.find(ownAddress)->second = process_state::WAITING;
@@ -391,7 +436,7 @@ void monitor::wait(std::string objectName, bool& lockAcquired)
 		}
 		else
 		{
-			waitingThreads.find(objectName)->second.insert(std::pair<std::string, process_state>(ownAddress, process_state::WAITING));
+			waitingThreads.find(objectName)->second.insert(std::make_pair(ownAddress, process_state::WAITING));
 			currentState = process_state::WAITING;
 		}
 		Sleep(15);
@@ -463,9 +508,9 @@ void monitor::pulse_all(std::string objectName)
 }
 void monitor::exit(std::string objectName)
 {
-	if (find(currentRequestedOrTakenObjects.begin(), currentRequestedOrTakenObjects.end(), objectName) != currentRequestedOrTakenObjects.end())
+	if (currentRequestedOrTakenObjects.find(objectName) != currentRequestedOrTakenObjects.end())
 	{
-		currentRequestedOrTakenObjects.remove(objectName);
+		currentRequestedOrTakenObjects.erase(objectName);
 	}
 	if (waitingThreads.find(objectName) != waitingThreads.end())
 	{
@@ -484,55 +529,75 @@ void monitor::check_for_other_processes()
 	int msgLen;
 	std::string msg;
 	std::vector<std::string> receivedMsgs;
+	while (!check_for_more_ports()) 
+	{ 
+		Sleep(100); 
+	}
 	while (infinite)
 	{
-		check_for_more_ports();
 		if ((msgLen = zmq_recv(sckt, bufMsg, 256, 0)) > -1)
 		{
 			msg.assign(bufMsg, msgLen);
 			receivedMsgs = split(msg);
-			if (receivedMsgs.size() > 2)
+			if (receivedMsgs[0] == "perment" && receivedMsgs.size() > 3)
 			{
-				if (receivedMsgs[0] == "perment")
+				std::string replyMsg = "ok";
+				std::cout << receivedMsgs[1] << " has requested to enter " << receivedMsgs[2] << " with timestamp " << receivedMsgs[3] << std::endl;
+				std::map<std::string, std::map<std::string, process_state>>::iterator it = waitingThreads.find(receivedMsgs[2]);
+				std::map<std::string, std::string>::iterator it3 = currentRequestedOrTakenObjects.find(receivedMsgs[2]);
+				if (it3 != currentRequestedOrTakenObjects.end() && it3->second.compare(receivedMsgs[3]) < 0)
 				{
-					std::string replyMsg = "ok";
-					std::cout << receivedMsgs[1] << " has requested to enter " << receivedMsgs[2] << std::endl;
-					std::map<std::string, std::map<std::string, process_state>>::iterator it = waitingThreads.find(receivedMsgs[2]);
-					if (find(currentRequestedOrTakenObjects.begin(), currentRequestedOrTakenObjects.end(), receivedMsgs[2]) != currentRequestedOrTakenObjects.end())
+					replyMsg = "no";
+				}
+				if (it != waitingThreads.end() && replyMsg != "no")
+				{
+					for (std::map<std::string, process_state>::iterator it2 = it->second.begin(); it2 != it->second.end(); it2++)
 					{
-						replyMsg = "no";
-					}
-					if (it != waitingThreads.end() && replyMsg != "no")
-					{
-						for (std::map<std::string, process_state>::iterator it2 = it->second.begin(); it2 != it->second.end(); it2++)
+						if (it2->second == process_state::WORKING)
 						{
-							if (it2->second == process_state::WORKING)
-							{
-								replyMsg = "no";
-								break;
-							}
+							replyMsg = "no";
+							break;
 						}
 					}
-					zmq_send(sckt, replyMsg.c_str(), 2, 0);
+				}
+				zmq_send(sckt, replyMsg.c_str(), 2, 0);
+			}
+			else if (receivedMsgs.size() > 2)
+			{
+				if (receivedMsgs[0] == "waiting")
+				{
+					zmq_send(sckt, "ok", 2, 0);
+					std::cout << receivedMsgs[1] << " is waiting on " << receivedMsgs[2] << std::endl;
+					add_process(receivedMsgs[2], receivedMsgs[1], process_state::WAITING);
+				}
+				else if (receivedMsgs[0] == "entered")
+				{
+					zmq_send(sckt, "ok", 2, 0);
+					std::cout << receivedMsgs[1] << " has entered " << receivedMsgs[2] << std::endl;
+					add_process(receivedMsgs[2], receivedMsgs[1], process_state::WORKING);
+				}
+				else if (receivedMsgs[0] == "release")
+				{
+					zmq_send(sckt, "ok", 2, 0);
+					std::cout << receivedMsgs[1] << " has released " << receivedMsgs[2] << std::endl;
+					remove_process(receivedMsgs[2], receivedMsgs[1]);
 				}
 				else
 				{
+					zmq_send(sckt, "fail", 4, 0);
+				}
+			}
+			else if (receivedMsgs.size() > 1)
+			{
+				if (receivedMsgs[0] == "newproc")
+				{
 					zmq_send(sckt, "ok", 2, 0);
-					if (receivedMsgs[0] == "waiting")
-					{
-						std::cout << receivedMsgs[1] << " is waiting on " << receivedMsgs[2] << std::endl;
-						add_process(receivedMsgs[2], receivedMsgs[1], process_state::WAITING);
-					}
-					else if (receivedMsgs[0] == "entered")
-					{
-						std::cout << receivedMsgs[1] << " has entered " << receivedMsgs[2] << std::endl;
-						add_process(receivedMsgs[2], receivedMsgs[1], process_state::WORKING);
-					}
-					else if (receivedMsgs[0] == "release")
-					{
-						std::cout << receivedMsgs[1] << " has released " << receivedMsgs[2] << std::endl;
-						remove_process(receivedMsgs[2], receivedMsgs[1]);
-					}
+					std::cout << "new Process joined " << receivedMsgs[1] << std::endl;
+					add_process_address(receivedMsgs[1]);
+				}
+				else
+				{
+					zmq_send(sckt, "fail", 4, 0);
 				}
 			}
 			else
