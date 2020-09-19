@@ -122,7 +122,11 @@ void monitor::send_all_message(std::string objectName, std::string msg, int addP
 }
 void monitor::add_process_address(std::string address)
 {
-	allProcessesAddresses.push_back(address);
+	if (std::find(allProcessesAddresses.begin(), allProcessesAddresses.end(), address) == allProcessesAddresses.end())
+	{
+		allProcessesAddresses.push_back(address);
+		std::cout << "Added to addresses: " << address << std::endl;
+	}
 }
 void monitor::add_process(std::string objectName, std::string processAddress, process_state state)
 {
@@ -164,7 +168,7 @@ bool monitor::request_permission_to_enter(std::string objectName, std::string ti
 	char* bufMsg = new char[256];
 	int recvMsgLen;
 	std::string finalReply;
-	int timeout = 2000;
+	int timeout = 20000;
 	zmq_setsockopt(scktR, ZMQ_RCVTIMEO, &timeout, sizeof(int));
 	std::string toSendMsg = "perment," + ownAddress + "," + objectName + "," + timestamp;
 	for (int i = 0; i < allProcessesAddressesTMP.size(); i++)
@@ -179,6 +183,7 @@ bool monitor::request_permission_to_enter(std::string objectName, std::string ti
 					if (finalReply == "no" || finalReply == "fail")
 					{
 						permIssued = false;
+						break;
 					}
 				}
 			}
@@ -209,7 +214,9 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 	currentState = process_state::REQUESTING;
 	std::stringstream timestamp;
 	timestamp << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	while (mtx.try_lock() == false) {}
 	currentRequestedOrTakenObjects.insert(std::make_pair(objectName, timestamp.str()));
+	mtx.unlock();
 	lockAcquired = false;
 	while (!lockAcquired)
 	{
@@ -219,16 +226,15 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 		{
 			if (request_permission_to_enter(objectName, timestamp.str()))
 			{
+				send_all_message(objectName, "entered", 0);
 				std::map<std::string, process_state> m;
 				m.insert(std::make_pair(ownAddress, process_state::WORKING));
 				waitingThreads.insert(std::make_pair(objectName, m));
 				lockAcquired = true;
-				send_all_message(objectName, "entered", 0);
 			}
 			else
 			{
 				lockAcquired = false;
-				currentRequestedOrTakenObjects.erase(objectName);
 			}
 		}
 		else
@@ -240,7 +246,6 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 				{
 					isTaken = true;
 					lockAcquired = false;
-					currentRequestedOrTakenObjects.erase(objectName);
 					break;
 				}
 			}
@@ -262,7 +267,6 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 				else
 				{
 					lockAcquired = false;
-					currentRequestedOrTakenObjects.erase(objectName);
 				}
 			}
 		}
@@ -273,11 +277,12 @@ void monitor::enter(std::string objectName, bool& lockAcquired)
 }
 void monitor::try_enter(std::string objectName, bool& lockAcquired)
 {
+	while (mtx.try_lock() == false) {}
+	lockAcquired = false;
 	currentState = process_state::REQUESTING;
 	std::stringstream timestamp;
 	timestamp << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 	currentRequestedOrTakenObjects.insert(std::make_pair(objectName, timestamp.str()));
-	while (mtx.try_lock() == false) {}
 	std::map<std::string, std::map<std::string, process_state>>::iterator it = waitingThreads.find(objectName);
 	if (it == waitingThreads.end())
 	{
@@ -336,6 +341,7 @@ void monitor::try_enter(std::string objectName, bool& lockAcquired)
 }
 void monitor::wait(std::string objectName, int miliseconds, bool& lockAcquired)
 {
+	lockAcquired = false;
 	std::ostringstream ss;
 	ss << "tcp://127.0.0.1:" << ownPort + 1;
 	void* scktW = zmq_socket(context, ZMQ_REP);
@@ -371,6 +377,7 @@ void monitor::wait(std::string objectName, int miliseconds, bool& lockAcquired)
 			currentState = process_state::WAITING;
 		}
 		send_all_message(objectName, "waiting", 0);
+		Sleep(1000);
 		while (miliseconds > 0 && (receivedMsgs.size() == 0 || receivedMsgs[0] != "release"))
 		{
 			if ((msgLen = zmq_recv(scktW, bufMsg, 256, 0)) > -1)
@@ -403,6 +410,7 @@ void monitor::wait(std::string objectName, int miliseconds, bool& lockAcquired)
 }
 void monitor::wait(std::string objectName, bool& lockAcquired)
 {
+	lockAcquired = false;
 	std::ostringstream ss;
 	char* bufMsg = new char[256];
 	int msgLen;
@@ -439,7 +447,7 @@ void monitor::wait(std::string objectName, bool& lockAcquired)
 			waitingThreads.find(objectName)->second.insert(std::make_pair(ownAddress, process_state::WAITING));
 			currentState = process_state::WAITING;
 		}
-		Sleep(15);
+		Sleep(1000);
 		send_all_message(objectName, "waiting", 0);
 		while (!lockAcquired && (receivedMsgs.size() == 0 || receivedMsgs[0] != "release"))
 		{
@@ -541,6 +549,7 @@ void monitor::check_for_other_processes()
 			receivedMsgs = split(msg);
 			if (receivedMsgs[0] == "perment" && receivedMsgs.size() > 3)
 			{
+				while (mtx.try_lock() == false) {}
 				std::string replyMsg = "ok";
 				std::cout << receivedMsgs[1] << " has requested to enter " << receivedMsgs[2] << " with timestamp " << receivedMsgs[3] << std::endl;
 				std::map<std::string, std::map<std::string, process_state>>::iterator it = waitingThreads.find(receivedMsgs[2]);
@@ -561,6 +570,7 @@ void monitor::check_for_other_processes()
 					}
 				}
 				zmq_send(sckt, replyMsg.c_str(), 2, 0);
+				mtx.unlock();
 			}
 			else if (receivedMsgs.size() > 2)
 			{
